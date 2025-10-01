@@ -5,11 +5,13 @@ import SectionCard from "../components/SectionCard";
 import ConnectorCard from "../components/ConnectorCard";
 import SearchBar from "../components/SearchBar";
 import ProjectCard from "../components/ProjectCard";
+import TokenModal from "../components/TokenModal";
+import { apiGet, getApiBase } from "../lib/api";
 
 type JiraProject = { key: string; name: string };
 type ConnectorStatus = "connected" | "disconnected";
 
-const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:3001";
+const API_BASE = getApiBase();
 
 export default function Home() {
   // Connector states
@@ -19,47 +21,100 @@ export default function Home() {
   const [confStatus, setConfStatus] = React.useState<ConnectorStatus>("disconnected");
   const [confMeta, setConfMeta] = React.useState<string>("—");
 
+  // OAuth / callback banner
+  const [isCallbackRefreshing, setIsCallbackRefreshing] = React.useState(false);
+  const [callbackError, setCallbackError] = React.useState<string | null>(null);
+
+  // Token modal visibility
+  const [showJiraToken, setShowJiraToken] = React.useState(false);
+  const [showConfToken, setShowConfToken] = React.useState(false);
+
   // Projects state
   const [projects, setProjects] = React.useState<JiraProject[]>([]);
   const [loadingProjects, setLoadingProjects] = React.useState<boolean>(false);
   const [projectsError, setProjectsError] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState<string>("");
 
-  // Fetch connector statuses (best-effort; adjust endpoint paths to your backend)
-  React.useEffect(() => {
-    let cancelled = false;
+  // Fetch connector statuses
+  const fetchStatuses = React.useCallback(async () => {
+    try {
+      const [jira, conf] = await Promise.allSettled([
+        apiGet<unknown>("/auth/jira/status"),
+        apiGet<unknown>("/auth/confluence/status"),
+      ]);
 
-    async function fetchStatus() {
-      try {
-        const [jiraRes, confRes] = await Promise.allSettled([
-          fetch(`${API_BASE}/auth/jira/status`, { cache: "no-store" }),
-          fetch(`${API_BASE}/auth/confluence/status`, { cache: "no-store" }),
-        ]);
-
-        if (!cancelled) {
-          if (jiraRes.status === "fulfilled" && jiraRes.value.ok) {
-            const data = await jiraRes.value.json().catch(() => ({}));
-            const connected = Boolean(data?.connected ?? data?.is_connected ?? data?.status === "connected");
-            setJiraStatus(connected ? "connected" : "disconnected");
-            if (typeof data?.projects_count === "number") setJiraMeta(`${data.projects_count} Projects`);
-          }
-
-          if (confRes.status === "fulfilled" && confRes.value.ok) {
-            const data = await confRes.value.json().catch(() => ({}));
-            const connected = Boolean(data?.connected ?? data?.is_connected ?? data?.status === "connected");
-            setConfStatus(connected ? "connected" : "disconnected");
-            if (typeof data?.spaces_count === "number") setConfMeta(`${data.spaces_count} Spaces`);
-          }
+      if (jira.status === "fulfilled") {
+        const data = jira.value as Record<string, unknown>;
+        const connected = Boolean(
+          data?.connected ?? data?.is_connected ?? (data?.status as string) === "connected"
+        );
+        setJiraStatus(connected ? "connected" : "disconnected");
+        if (typeof data?.projects_count === "number") {
+          setJiraMeta(`${data.projects_count as number} Projects`);
+        } else if (connected) {
+          setJiraMeta("Connected");
+        } else {
+          setJiraMeta("—");
         }
-      } catch {
-        // ignore; UI will reflect disconnected until data proves otherwise
       }
-    }
 
-    fetchStatus();
-    return () => {
-      cancelled = true;
-    };
+      if (conf.status === "fulfilled") {
+        const data = conf.value as Record<string, unknown>;
+        const connected = Boolean(
+          data?.connected ?? data?.is_connected ?? (data?.status as string) === "connected"
+        );
+        setConfStatus(connected ? "connected" : "disconnected");
+        if (typeof data?.spaces_count === "number") {
+          setConfMeta(`${data.spaces_count as number} Spaces`);
+        } else if (connected) {
+          setConfMeta("Connected");
+        } else {
+          setConfMeta("—");
+        }
+      }
+    } catch {
+      // soft fail
+    }
+  }, []);
+
+  React.useEffect(() => {
+    fetchStatuses();
+  }, [fetchStatuses]);
+
+  // Detect OAuth callback by query params (common: code/state or oauth_token)
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    const hasOAuthParams =
+      url.searchParams.has("code") ||
+      url.searchParams.has("state") ||
+      url.searchParams.has("oauth_token") ||
+      url.searchParams.has("jira_oauth") ||
+      url.searchParams.has("conf_oauth");
+
+    if (hasOAuthParams) {
+      setIsCallbackRefreshing(true);
+      // Allow backend to complete callback via its own redirect flow; we just refresh statuses.
+      fetchStatuses()
+        .then(async () => {
+          // Optionally refresh projects after Jira connects
+          await loadProjects(query);
+        })
+        .catch((e) => {
+          const msg =
+            typeof e === "object" && e !== null && "message" in e
+              ? (e as { message: string }).message
+              : "Authentication updated, but failed to refresh status.";
+          setCallbackError(msg);
+        })
+        .finally(() => {
+          setIsCallbackRefreshing(false);
+          // Clean the URL so users can refresh without repeating callback state
+          url.search = "";
+          window.history.replaceState({}, document.title, url.toString());
+        });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Fetch Jira projects list (and infer jira status if status endpoint unavailable)
@@ -122,7 +177,7 @@ export default function Home() {
         setLoadingProjects(false);
       }
     },
-    []
+    [API_BASE]
   );
 
   React.useEffect(() => {
@@ -135,23 +190,64 @@ export default function Home() {
   }
 
   // Sidebar CTA handlers (wire to OAuth/API token flow endpoints)
+  const startOAuth = async (path: string) => {
+    try {
+      // some backends return { url }, some do 302. Support both:
+      const res = await fetch(`${API_BASE}${path}`, { method: "GET", redirect: "follow" });
+      // If it redirected, browser should have followed. If still here, try parse URL from JSON.
+      if (res.redirected && res.url) {
+        window.location.href = res.url;
+        return;
+      }
+      const text = await res.text();
+      try {
+        const json = JSON.parse(text) as { url?: string; redirect_url?: string };
+        const url = json.url || json.redirect_url;
+        if (url) {
+          window.location.href = url;
+          return;
+        }
+      } catch {
+        // not JSON; if text looks like URL, attempt redirect
+        if (/^https?:\/\//i.test(text.trim())) {
+          window.location.href = text.trim();
+          return;
+        }
+      }
+      // fallback: navigate to endpoint, backend may issue redirect
+      window.location.href = `${API_BASE}${path}`;
+    } catch {
+      // as last resort, navigate
+      window.location.href = `${API_BASE}${path}`;
+    }
+  };
+
   const handleJiraCTA = () => {
     if (jiraStatus === "connected") {
       loadProjects(query);
     } else {
-      window.location.href = `${API_BASE}/auth/jira/oauth/start`;
+      startOAuth("/auth/jira/oauth/start");
     }
   };
 
   const handleConfluenceCTA = () => {
     if (confStatus === "connected") {
-      window.location.href = `${API_BASE}/confluence/spaces`;
+      // If connected, attempt to open spaces endpoint in a new tab (or could navigate to a UI route)
+      window.open(`${API_BASE}/confluence/spaces`, "_blank", "noopener,noreferrer");
     } else {
-      window.location.href = `${API_BASE}/auth/confluence/oauth/start`;
+      startOAuth("/auth/confluence/oauth/start");
     }
   };
 
   const renderProjects = () => {
+    if (isCallbackRefreshing) {
+      return (
+        <div className="py-8 text-sm text-slate-600" role="status" aria-live="polite">
+          Finalizing authentication... refreshing data.
+        </div>
+      );
+    }
+
     if (loadingProjects) {
       return (
         <div className="py-8 text-sm text-slate-500" role="status" aria-live="polite">
@@ -194,6 +290,12 @@ export default function Home() {
 
   return (
     <main className="max-w-[1200px] mx-auto px-6 md:px-8 py-6">
+      {callbackError ? (
+        <div className="mb-3 p-3 rounded-md bg-red-50 text-sm text-red-700 border border-red-200">
+          {callbackError}
+        </div>
+      ) : null}
+
       <div className="grid grid-cols-1 md:grid-cols-[320px_minmax(0,1fr)] gap-6">
         <aside className="bg-white rounded-lg shadow-md p-4" aria-label="Available connectors">
           <h2 className="text-base font-semibold mb-3">Available Connectors</h2>
@@ -204,6 +306,11 @@ export default function Home() {
               meta={jiraMeta}
               description="Connect to Atlassian JIRA to manage projects and issues"
               cta={{ label: jiraStatus === "connected" ? "Refresh" : "Connect", onClick: handleJiraCTA, ariaLabel: "Jira connector action" }}
+              secondaryCta={{
+                label: "Use API Token",
+                onClick: () => setShowJiraToken(true),
+                ariaLabel: "Connect Jira using API Token",
+              }}
             />
             <ConnectorCard
               name="Confluence"
@@ -211,9 +318,14 @@ export default function Home() {
               meta={confMeta}
               description="Connect to Atlassian Confluence to manage content"
               cta={{
-                label: confStatus === "connected" ? "Open" : "Connect",
+                label: confStatus === "connected" ? "View" : "Connect",
                 onClick: handleConfluenceCTA,
                 ariaLabel: "Confluence connector action",
+              }}
+              secondaryCta={{
+                label: "Use API Token",
+                onClick: () => setShowConfToken(true),
+                ariaLabel: "Connect Confluence using API Token",
               }}
             />
           </div>
@@ -226,6 +338,25 @@ export default function Home() {
           {renderProjects()}
         </SectionCard>
       </div>
+
+      {/* Token modals */}
+      <TokenModal
+        open={showJiraToken}
+        connector="jira"
+        onClose={() => setShowJiraToken(false)}
+        onSuccess={() => {
+          fetchStatuses();
+          loadProjects(query);
+        }}
+      />
+      <TokenModal
+        open={showConfToken}
+        connector="confluence"
+        onClose={() => setShowConfToken(false)}
+        onSuccess={() => {
+          fetchStatuses();
+        }}
+      />
     </main>
   );
 }
